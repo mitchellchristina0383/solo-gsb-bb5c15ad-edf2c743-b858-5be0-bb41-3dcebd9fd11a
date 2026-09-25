@@ -4,6 +4,8 @@
     POST /paths                  写入 SVG path 数据及填充规则
     POST /paths/{id}/normalize   按轮廓包含层级分类外环/孔洞并重写方向
     POST /paths/{id}/metrics     只读：填充总面积与面积质心（外环/孔/岛交替计入）
+    POST /paths/{id}/section-properties 只读：截面惯性矩分析（质心 Ix/Iy/Ixy、
+                                 主惯性矩与较大主值主轴角）
     POST /paths/{id}/scanlines   只读：水平扫描线上的填充区间（供逐行加工）
     POST /paths/{id}/clearance   轮廓间安全间隙（最小欧氏距离）即时校验
     POST /paths/{id}/cut-plan    闭合轮廓加工计划（后代先加工 + 最近入刀点贪心）
@@ -39,6 +41,7 @@ from .holeclearance import compute_hole_clearance
 from .intersections import find_intersections
 from .metrics import compute_metrics
 from .scanlines import MAX_SCANLINES, compute_scanlines
+from .sectionprops import compute_section_properties
 from .svggeo import SVGPathError, analyze_contours, normalize_path
 from .tabs import MAX_TABS, compute_tabs
 from .windowcov import MAX_WINDOWS, compute_window_coverage
@@ -52,9 +55,9 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="SVG 轮廓规范化 API",
-    version="1.10.0",
+    version="1.11.0",
     description="写入 SVG path，按包含层级分类外环/孔洞并重写绕向，"
-                "支持填充面积与面积质心分析、水平扫描线填充区间、"
+                "支持填充面积与面积质心分析、截面惯性矩分析、水平扫描线填充区间、"
                 "轮廓间安全间隙校验、闭合轮廓加工计划、外环微桥布置、"
                 "孔洞最大内接圆钻孔选点、矩形窗口覆盖分析"
                 "与两条已存路径的版本差异审计。",
@@ -419,6 +422,22 @@ def metrics(path_id: int,
                             detail=f"SVG path 无法解析: {exc}")
 
     result = compute_metrics(contours)
+    return {"id": path_id, "fill_rule": row["fill_rule"], **result}
+
+
+@app.post("/paths/{path_id}/section-properties")
+def section_properties(path_id: int,
+                       conn: Connection = Depends(get_db)) -> dict[str, Any]:
+    row = _get_row(conn, path_id)
+
+    # 即时解析/分类：不依赖已保存的规范化结果，也不写库
+    try:
+        contours, _warnings = _analyze_row(row)
+    except SVGPathError as exc:
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                            detail=f"SVG path 无法解析: {exc}")
+
+    result = compute_section_properties(contours)
     return {"id": path_id, "fill_rule": row["fill_rule"], **result}
 
 

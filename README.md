@@ -5,6 +5,9 @@
 并重写绘制方向（外环顺时针、孔洞逆时针），同时保留轮廓层级、原始索引与自定义元数据，
 对边界情况给出明确警告；另提供 **`POST /paths/{id}/metrics` 填充面积与面积质心分析**
 （按外环/孔洞/岛交替计入，曲线经细分多边形近似，只读不写库）、
+**`POST /paths/{id}/section-properties` 截面惯性矩分析**
+（对有效闭合环积分面积与一、二阶面积矩并按层级交替合成，绕净填充质心返回
+Ix / Iy / Ixy、两项主惯性矩与较大主值对应的主轴角，只读不写库）、
 **`POST /paths/{id}/scanlines` 水平扫描线填充区间**
 （在整体包围盒内等间距取水平扫描线，按层级交替合并外环/孔/岛，输出逐行填充区间）、
 **`POST /paths/{id}/clearance` 轮廓间安全间隙校验**
@@ -40,6 +43,7 @@ evenodd / nonzero 填充规则汇总为 inside / outside，开放子路径不参
 │   ├── db.py          # SQLite 连接与幂等建表
 │   ├── svggeo.py      # SVG path 解析 / 细分 / 包含层级 / 方向重写 / 几何指纹 / 线段距离（零三方依赖）
 │   ├── metrics.py     # 填充面积与面积质心：外/孔/岛交替计入，基于细分多边形
+│   ├── sectionprops.py # 截面惯性矩分析：环面积矩积分 + 平行轴合成、主惯性矩与主轴角
 │   ├── scanlines.py   # 水平扫描线填充区间：半开边求交、按层级交替合并，逐行输出
 │   ├── clearance.py   # 轮廓间安全间隙校验：逐段最小欧氏距离、孔-直接 parent 标记
 │   ├── cutplan.py     # 闭合轮廓加工计划：后代先加工 + 最近入刀点贪心、逐段空走距离
@@ -49,7 +53,7 @@ evenodd / nonzero 填充规则汇总为 inside / outside，开放子路径不参
 │   ├── holeclearance.py # 孔洞最大内接圆：距离上界优先网格细分、直属岛避让、预算超限报错
 │   ├── windowcov.py   # 矩形窗口覆盖分析：Sutherland–Hodgman 裁剪、层级交替累加、逐窗覆盖率
 │   └── diff.py        # 版本差异审计：指纹+索引稳定匹配、三类 modified 分类
-├── tests/             # pytest 单元 + API 端到端测试（323 个）
+├── tests/             # pytest 单元 + API 端到端测试（359 个）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt
@@ -212,6 +216,78 @@ curl -s -X POST localhost:8000/paths/1/metrics
 ```
 
 路径不存在返回 `404`；已存路径无法解析（历史脏数据）返回 `422`。
+
+### `POST /paths/{id}/section-properties` — 截面惯性矩分析（只读）
+
+对已存路径**即时解析**并完成轮廓包含层级分类（无需事先调用 normalize，
+**不写规范化状态、不写数据库**），复用与 metrics / clearance 相同的曲线
+细分折线，对每个**有效闭合环**（`outer` / `hole`）按格林公式在细分多边形上
+积分面积与一、二阶面积矩，再按**包含层级交替**合成净填充截面：
+
+- 外环 `outer`（深度 0、2、4 …）**+** 计入，孔洞 `hole`（深度奇数）**−** 扣减，
+  孔中岛（深度 2）重新计入，岛中孔继续扣减，依此类推；
+- 每环先绕**自身质心**积分，再按**平行轴定理**搬到净填充质心合成
+  （避免远离原点的大坐标相消误差），结果与轮廓书写方向无关；
+- **开放轮廓**（未以 `Z` 闭合）与**退化轮廓**（面积为 0 或顶点不足）不参与，
+  列入 `skipped_contours`；
+- 净填充面积为零（空路径、仅开放/退化轮廓，或净面积被孔洞完全抵消）时
+  `centroid`、`ix` / `iy` / `ixy` 与 `principal` 均为 `null`，`area` 为 `0.0`。
+
+无请求体。
+
+```bash
+# 外方 0..10 含内孔 2..8：净面积 64，Ix = Iy = 10·10³/12 − 6·6³/12 = 725.333
+curl -s -X POST localhost:8000/paths/1/section-properties
+```
+
+响应：
+
+```json
+{
+  "id": 1,
+  "fill_rule": "nonzero",
+  "area": 64.0,
+  "centroid": {"x": 5.0, "y": 5.0},
+  "ix": 725.333333333,
+  "iy": 725.333333333,
+  "ixy": 0.0,
+  "principal": {"max": 725.333333333, "min": 725.333333333,
+                "axis_angle_deg": 0.0},
+  "contributing_contour_count": 2,
+  "contours": [
+    {"original_index": 0, "role": "outer", "depth": 0,
+     "area": 100.0, "signed_contribution": 100.0,
+     "centroid": {"x": 5.0, "y": 5.0}},
+    {"original_index": 1, "role": "hole", "depth": 1,
+     "area": 36.0, "signed_contribution": -36.0,
+     "centroid": {"x": 5.0, "y": 5.0}}
+  ],
+  "skipped_contours": []
+}
+```
+
+- `ix` / `iy` / `ixy`：绕**净填充质心** `(cx, cy)` 的截面二次矩——
+  `ix = ∫(y−cy)²dA`、`iy = ∫(x−cx)²dA`、`ixy = ∫(x−cx)(y−cy)dA`；
+- `principal`：主惯性矩 `max` / `min`（惯性张量两个特征值，`max ≥ min`）
+  与 `axis_angle_deg`——**较大主值**对应主轴的方向角，按 SVG 屏幕坐标
+  （y 轴向下）从 +x 朝 +y 计量，取值 **[0, 180) 度**；两个主值相等
+  （各向同性，如正方形、圆）时主轴不唯一，约定返回 `0°`；
+- `contours[]` / `skipped_contours[]`：与 metrics 同口径的逐环明细
+  （几何面积、带符号贡献、单环质心）与跳过原因（`open` / `degenerate`）；
+- 路径不存在返回 `404`；已存路径无法解析（历史脏数据）返回 `422`。
+
+偏心孔示例（外方 0..10 扣右上角 2×2 孔：净质心偏移，`ixy` 非零，
+较大主值 832.0 对应主轴角 135°）：
+
+```bash
+curl -s -X POST localhost:8000/paths -H 'Content-Type: application/json' -d '{
+  "d": "M0,0h10v10h-10Z M6,2h2v2h-2Z"
+}'
+curl -s -X POST localhost:8000/paths/1/section-properties
+# -> {"area":96.0, "centroid":{"x":4.916666667,"y":5.083333333},
+#     "ix":815.333333333, "iy":815.333333333, "ixy":16.666666667,
+#     "principal":{"max":832.0, "min":798.666666667, "axis_angle_deg":135.0}, ...}
+```
 
 ### `POST /paths/{id}/scanlines` — 水平扫描线填充区间（只读，供逐行加工）
 
@@ -965,7 +1041,7 @@ SVG 规范的端点参数化算法。
 
 ```bash
 pip install -r requirements-dev.txt
-pytest -q          # 323 passed
+pytest -q          # 359 passed
 ```
 
 覆盖：解析器边界、面积符号、外/孔/岛三层嵌套、同级双孔、曲线与弧反转几何等价性、
@@ -976,6 +1052,11 @@ added/removed、元数据透传、未规范化即时审计与脏数据 422；
 填充面积/质心的单环、外-孔、外-孔-岛、四层交替、书写方向无关、
 两种填充规则一致、曲线细分近似、开放与退化排除、空路径返回面积 0 与质心 null、
 只读不落库、404/脏数据 422；
+截面惯性矩的标准矩形公式、直角三角形质心矩、外-孔与外-孔-岛层级交替、
+偏心孔平行轴合成与非零惯性积、旋转矩形主值不变与主轴角随动（模 180 扫描）、
+45° 细杆主轴垂直、圆细分各向同性取 0°、书写方向无关、两种填充规则一致、
+开放与退化跳过、空路径与净面积抵消全 null、远离原点坐标无相消误差、
+无 -0.0、确定性与只读不落库、404/非法 id/脏数据 422；
 扫描线填充区间的单环/外-孔/孔-岛三层交替、间距起止与最大 y 不含、
 半开边顶点不重复计数、相切行空区间、离散外环区间升序不重叠、曲线细分、
 开放与退化跳过、无有效轮廓空列表、两种填充规则一致、恰好 1000 条放行与

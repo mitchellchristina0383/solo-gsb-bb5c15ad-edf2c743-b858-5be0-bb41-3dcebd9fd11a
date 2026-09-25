@@ -1556,3 +1556,164 @@ def test_window_coverage_422_on_unparseable_stored_path(client):
     assert r.status_code == 422
     assert "无法解析" in r.json()["detail"]
 
+
+# ---------------------------------------------------------------------------
+# POST /paths/{id}/section-properties 截面惯性矩分析（只读）
+# ---------------------------------------------------------------------------
+
+def test_section_properties_square(client):
+    pid = _mk(client, "M0,0h10v10h-10Z")
+    r = client.post(f"/paths/{pid}/section-properties")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["id"] == pid
+    assert body["fill_rule"] == "nonzero"
+    assert body["area"] == 100.0
+    assert body["centroid"] == {"x": 5.0, "y": 5.0}
+    assert abs(body["ix"] - 10 * 10 ** 3 / 12) < 1e-6
+    assert abs(body["iy"] - 10 * 10 ** 3 / 12) < 1e-6
+    assert body["ixy"] == 0.0
+    # 正方形各向同性：主值相等，轴角约定 0°
+    assert body["principal"]["max"] == body["ix"]
+    assert body["principal"]["min"] == body["iy"]
+    assert body["principal"]["axis_angle_deg"] == 0.0
+    assert body["contributing_contour_count"] == 1
+    assert body["contours"][0]["role"] == "outer"
+    assert body["skipped_contours"] == []
+
+
+def test_section_properties_wide_rectangle_axis_angle_90(client):
+    # 宽 20 高 10：较大主值绕 y 轴 -> 轴角 90°
+    pid = _mk(client, "M0,0h20v10h-20Z")
+    body = client.post(f"/paths/{pid}/section-properties").json()
+    assert abs(body["ix"] - 20 * 10 ** 3 / 12) < 1e-6
+    assert abs(body["iy"] - 10 * 20 ** 3 / 12) < 1e-6
+    assert body["ixy"] == 0.0
+    assert body["principal"]["max"] == body["iy"]
+    assert body["principal"]["min"] == body["ix"]
+    assert body["principal"]["axis_angle_deg"] == 90.0
+
+
+def test_section_properties_outer_hole_island(client):
+    # 100 - 64 + 4 = 40，同心 -> 质心 (5,5)，各向同性 -> 0°
+    pid = _mk(client, "M0,0h10v10h-10Z M1,1h8v8h-8Z M4,4h2v2h-2Z")
+    body = client.post(f"/paths/{pid}/section-properties").json()
+    assert body["area"] == 40.0
+    assert body["centroid"] == {"x": 5.0, "y": 5.0}
+    ix = 10 * 10 ** 3 / 12 - 8 * 8 ** 3 / 12 + 2 * 2 ** 3 / 12
+    assert abs(body["ix"] - ix) < 1e-6
+    assert abs(body["iy"] - ix) < 1e-6
+    assert body["ixy"] == 0.0
+    assert body["principal"]["axis_angle_deg"] == 0.0
+    assert [c["role"] for c in body["contours"]] == ["outer", "hole", "outer"]
+    assert [c["depth"] for c in body["contours"]] == [0, 1, 2]
+
+
+def test_section_properties_offcentre_hole_parallel_axis(client):
+    # 偏心孔经平行轴定理合成：Ixy 非零，主轴角 135°
+    pid = _mk(client, "M0,0h10v10h-10Z M6,2h2v2h-2Z")
+    body = client.post(f"/paths/{pid}/section-properties").json()
+    assert abs(body["centroid"]["x"] - 4.916666667) < 1e-6
+    assert abs(body["centroid"]["y"] - 5.083333333) < 1e-6
+    assert abs(body["ix"] - 815.333333333) < 1e-6
+    assert abs(body["iy"] - 815.333333333) < 1e-6
+    assert abs(body["ixy"] - 16.666666667) < 1e-6
+    assert abs(body["principal"]["max"] - 832.0) < 1e-6
+    assert abs(body["principal"]["min"] - 798.666666667) < 1e-6
+    assert body["principal"]["axis_angle_deg"] == 135.0
+
+
+def test_section_properties_orientation_independent(client):
+    # 同一几何顺/逆时针书写结果一致
+    cw = _mk(client, "M0,0h20v10h-20Z")
+    ccw = _mk(client, "M0,0 L0,10 L20,10 L20,0 Z")
+    b1 = client.post(f"/paths/{cw}/section-properties").json()
+    b2 = client.post(f"/paths/{ccw}/section-properties").json()
+    for key in ("area", "centroid", "ix", "iy", "ixy", "principal"):
+        assert b1[key] == b2[key], key
+
+
+def test_section_properties_evenodd_same_as_nonzero(client):
+    d = "M0,0h10v10h-10Z M2,2h6v6h-6Z"
+    nz = _mk(client, d, fill_rule="nonzero")
+    eo = _mk(client, d, fill_rule="evenodd")
+    b1 = client.post(f"/paths/{nz}/section-properties").json()
+    b2 = client.post(f"/paths/{eo}/section-properties").json()
+    assert b1["ix"] == b2["ix"] and b1["iy"] == b2["iy"]
+    assert b1["principal"] == b2["principal"]
+
+
+def test_section_properties_skips_open_and_degenerate(client):
+    d = "M0,0h10v10h-10Z M5,5 L8,5 L5,5 Z M20,0 L30,0 L30,10"
+    pid = _mk(client, d)
+    body = client.post(f"/paths/{pid}/section-properties").json()
+    assert body["area"] == 100.0
+    assert body["contributing_contour_count"] == 1
+    reasons = {(s["original_index"], s["reason"])
+               for s in body["skipped_contours"]}
+    assert reasons == {(1, "degenerate"), (2, "open")}
+
+
+def test_section_properties_empty_path_null(client):
+    pid = _mk(client, "")
+    body = client.post(f"/paths/{pid}/section-properties").json()
+    assert body["area"] == 0.0
+    assert body["centroid"] is None
+    assert body["ix"] is None and body["iy"] is None and body["ixy"] is None
+    assert body["principal"] is None
+    assert body["contributing_contour_count"] == 0
+
+
+def test_section_properties_net_zero_area_null(client):
+    # 外 100 - 孔 64 - 孔 36 = 0：净填充面积为零 -> 惯性矩与主轴角 null
+    pid = _mk(client, "M0,0h10v10h-10Z M1,1h8v8h-8Z M0.5,0.5h9v4h-9Z")
+    body = client.post(f"/paths/{pid}/section-properties").json()
+    assert body["area"] == 0.0
+    assert body["centroid"] is None
+    assert body["ix"] is None and body["iy"] is None and body["ixy"] is None
+    assert body["principal"] is None
+
+
+def test_section_properties_circle_isotropic(client):
+    # 单位圆（弧细分）：Ix≈Iy≈π/4，主值相等 -> 0°
+    import math
+    pid = _mk(client, "M-1,0 A1,1 0 1,0 1,0 A1,1 0 1,0 -1,0 Z")
+    body = client.post(f"/paths/{pid}/section-properties").json()
+    assert 0.77 < body["ix"] < math.pi / 4
+    assert abs(body["ix"] - body["iy"]) < 1e-9
+    assert body["principal"]["axis_angle_deg"] == 0.0
+
+
+def test_section_properties_is_readonly_and_needs_no_prior_normalization(client):
+    pid = _mk(client, "M0,0h10v10h-10Z M2,2h6v6h-6Z")
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    assert client.post(f"/paths/{pid}/section-properties").status_code == 200
+    # 只读：不产生规范化结果，重复调用一致
+    assert client.get(f"/paths/{pid}").json()["normalized"] is None
+    b1 = client.post(f"/paths/{pid}/section-properties").json()
+    b2 = client.post(f"/paths/{pid}/section-properties").json()
+    assert b1 == b2
+
+
+def test_section_properties_404(client):
+    assert client.post("/paths/999999/section-properties").status_code == 404
+
+
+def test_section_properties_id_path_validation(client):
+    # 非整数 id 走 FastAPI 422；数字 0 是合法 int，查无此路径 -> 404
+    assert client.post("/paths/x/section-properties").status_code == 422
+    assert client.post("/paths/0/section-properties").status_code == 404
+
+
+def test_section_properties_422_on_unparseable_stored_path(client):
+    from app import db
+    with db.get_conn() as conn:
+        cur = conn.execute(
+            "INSERT INTO paths (d, fill_rule, metadata, contour_metadata) "
+            "VALUES (?, 'nonzero', '{}', '[]')",
+            ("M0,0 L",))
+        bad_id = cur.lastrowid
+    r = client.post(f"/paths/{bad_id}/section-properties")
+    assert r.status_code == 422
+    assert "无法解析" in r.json()["detail"]
+
